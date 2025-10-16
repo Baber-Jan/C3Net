@@ -1,0 +1,151 @@
+# Configuration for C3Net
+
+model:
+  name: "C3Net" # Architecture name
+
+  image_processing:
+    target_size:
+      392 # Input size (H=W). Must be divisible by encoder patch_size (14). 392/14=28.
+      # Increasing size (e.g., 504) improved performance but significantly increased GFLOPs (C3Net-L504).
+      # Decreasing size improves speed but likely harms performance. 392 offers the best balance found.
+    normalize_mean: [0.485, 0.456, 0.406] # Standard ImageNet mean for pre-trained backbone compatibility.
+    normalize_std: [0.229, 0.224, 0.225] # Standard ImageNet std dev.
+
+  encoder:
+    # Using DINOv2-Large with registers - Provided best performance/efficiency balance.
+    model_name: "facebook/dinov2-with-registers-large"
+    variant: "large"
+    # Standard ViT-L stages providing early features (1, 2) for EdgeBranch (texture/detail)
+    # and late features (23, 24) for LocBranch (semantics). Modifying these changes information source.
+    output_stages: [1, 2, 23, 24]
+    patch_size: 14 # Native patch size for DINOv2 /14 models.
+
+  # --- Decoder Settings ---
+  decoder:
+    # --- Upsampler Settings ---
+    # Retaining DySample based on EXP-Upsample showing slight overall benefit vs bicubic.
+    upsampler:
+      style: "lp" # DySample style ('lp' or 'pl'). 'lp' is often default.
+      groups: 4 # DySample groups. Must divide input channels. Affects internal offset prediction diversity/cost.
+      dyscope: False # DySample dynamic scope mechanism. Keep disabled unless proven beneficial.
+
+    # --- Edge Branch Settings ---
+    # Channels define capacity and information flow. These values align with a robust ViT-L decoder.
+    edge_branch:
+      # Channel dimensions: [AdaptC, Fuse1C, EnhanceOutputC]
+      # AdaptC: After initial 1x1 adaptation of S1/S2 features (Encoder D -> AdaptC).
+      # Fuse1C: After fusing upsampled S1/S2 streams (2*AdaptC -> Fuse1C). Also channels within EnhanceBlocks.
+      # EnhanceOutputC: Target channels after enhance blocks (Fuse1C -> EnhanceOutputC).
+      intermediate_channels: [512, 256, 128] # Capacity matching Large backbone features well.
+      # Channel dimension before the *final* upsampling stage (AdaptFinalC).
+      # Determines output channels passed to Fusion Head. Needs to match loc_branch output & fusion_head input.
+      output_channels: 128
+      # Number of EdgeEnhanceBlocks. More blocks -> deeper edge feature refinement, higher cost. 2 is a reasonable default.
+      num_enhance_blocks: 2
+
+    # --- Localization Branch Settings ---
+    loc_branch:
+      # Channel dimensions: [AdaptC, Fuse1C, Refine2OutputC]
+      # AdaptC: After initial 1x1 adaptation of S(N-1)/SN features (Encoder D -> AdaptC). Input to EnhanceBlocks & ICG.
+      # Fuse1C: After fusing upsampled (modulated) SN and S(N-1) streams (2*AdaptC -> Fuse1C). Input to RefineBlock2.
+      # Refine2OutputC: Target channels after optional RefineBlock2 (Fuse1C -> Refine2OutputC).
+      intermediate_channels: [512, 256, 128] # Matched to Edge Branch for consistency.
+      # Channel dimension before the *final* upsampling stage (AdaptFinalC).
+      # Determines output channels passed to Fusion Head.
+      output_channels: 128
+      # Number of SemanticEnhanceBlocks applied to F_N stream before ICG. More blocks -> deeper semantic refinement. 1 is minimal.
+      num_enhance_blocks: 1
+
+      # ICG Parameters:
+      # Increasing channels here slightly increases ICG capacity/cost. Changing pool kernel affects contrast locality.
+      icg_params:
+        image_channels: 3 # Input image channels (RGB).
+        ia_cnn_channels: 32 # Output C of the simple 2-layer ImageAppearanceCNN.
+        contrast_channels: 16 # Output C of the contrast calculation's refiner layer.
+        contrast_agg_kernel: 5 # GuidedContrast aggregation kernel size for spatial pooling.
+        contrast_bg_thresh: 0.1 # Background threshold for global context extraction (hypothesis < thresh).
+
+  # --- Final Fusion Head Settings ---
+  fusion_head:
+    # Intermediate channel dimension after adapting branch outputs and within refinement blocks.
+    # Should match the `output_channels` of the Edge and Loc branches for direct processing.
+    fuse_channels: 128
+    # Number of ConvGNReLU refinement blocks applied after fusion. More blocks = deeper refinement, more cost. 2 is standard.
+    num_refine_blocks: 2
+    # Intermediate channels in the attention pathway generating the gate (where Loc representation gates Edge representation).
+    # Controls capacity of the gating signal generator relative to `fuse_channels`.
+    attn_gen_intermediate_channels: 64 # Half of fuse_channels provides reasonable capacity here.
+
+# --- Training Configuration ---
+training:
+  num_epochs: 200 # Total training epochs. Adjust based on validation curve convergence.
+  batch_size: 36 # Samples per GPU per step. Maximize based on GPU memory for stable gradients.
+  use_amp: true # Use Automatic Mixed Precision (FP16). Highly recommended for speed/memory.
+  num_workers: 0 # DataLoader workers. Increase if data loading is a bottleneck, limited by CPU cores.
+  val_ratio: 0.1 # Fraction of training data for validation. Standard practice.
+  save_freq: 20 # Save model checkpoint every N epochs. Balance disk space vs. recovery ability.
+  gradient_clip: 1.0 # Max norm for gradients. Prevents exploding gradients. Tune if clipping happens often or gradients vanish.
+  early_stop_patience: 25 # Stop if validation metric doesn't improve for N epochs. Prevents overfitting/wasted time. Increase for noisy validation.
+  min_delta: 0.0005 # Minimum change considered an improvement for early stopping. Prevents stopping due to tiny fluctuations.
+
+  optimizer:
+    # AdamW is generally robust.
+    learning_rate: 0.0001 # Initial LR. Needs tuning. Too high diverges, too low converges slowly/suboptimally.
+    weight_decay: 0.01 # L2 regularization. Higher = more regularization, less overfitting, potentially underfitting.
+    # Encoder LR Ratio: Controls backbone fine-tuning speed vs. decoder.
+    # 0.2 allows moderate adaptation based on DINOv2's robustness. Lower (e.g., 0.1) freezes more, higher (e.g., 0.5-1.0) risks forgetting pre-trained knowledge.
+    encoder_lr_ratio: 0.2
+
+  scheduler: # Settings for ReduceLROnPlateau
+    factor: 0.5 # LR reduction factor. Smaller factor (e.g., 0.1) = more aggressive reduction.
+    patience: 10 # Epochs patience before reducing LR. Lower patience = faster LR decay.
+    min_lr: 0.000001 # Floor for learning rate.
+
+  # --- Loss Function Configuration ---
+  loss:
+    # Deep Supervision Weights: Balance intermediate vs final losses.
+    # w_final=1.2 gives more importance to the final output quality. Adjusting ratio (e.g., 1:1:1 or 1:1:3) tunes this balance.
+    w_edge: 1.0
+    w_loc: 1.15
+    w_final: 1.2
+    # Focal Loss Params: Standard values effective for foreground/background imbalance.
+    focal_alpha: 0.25 # Increase towards 0.5 if positives are extremely rare, decrease if negatives are rare.
+    focal_gamma: 3.0 # Increase (e.g., 3.0) to focus even more strongly on hard examples.
+    # Tversky Loss Params: Tailored Precision/Recall based on reasoning.
+    # Loc Loss (Post-ICG @ P1): Prioritize Precision (alpha > beta). Higher alpha = stronger FP penalty.
+    tversky_alpha_loc: 0.6
+    tversky_beta_loc: 0.4
+    # Final Loss: Prioritize Recall (beta > alpha). Higher beta = stronger FN penalty.
+    tversky_alpha_final: 0.4
+    tversky_beta_final: 0.6
+    # Final Edge Dice Loss: Gentle boundary refinement.
+    # Set low based on EXP-Loss results. Increase cautiously (e.g., 0.2) for potentially sharper edges but monitor metrics closely. Decrease/set to 0 to disable.
+    final_edge_dice_weight: 0.2
+    # Intermediate Edge Loss Params: Control specialized edge supervision.
+    edge_focal_weight: 5.0 # Strength of focus near GT edges. Increase for stronger edge focus.
+    edge_reg_weight: 0.15 # Strength of TV regularization. Increase for smoother predicted backgrounds in edge map.
+    edge_dist_cutoff: 5 # Spatial extent (via pooling iterations) of edge focus zone. Increase for wider zone.
+    # Instance Weighting Params: Handle scale variance.
+    instance_weight_k: 3.0 # Strength of weight boost (k=0 disables). Increase for more emphasis on extreme scales.
+    instance_weight_low_thresh: 0.02 # Defines "very small" object ratio.
+    instance_weight_high_thresh: 0.8 # Defines "very large" object ratio.
+    # General Epsilon
+    eps: 0.0000001 # 1e-7
+
+  datasets: # List of datasets used for training
+    - "datasets/COD10K"
+    - "datasets/CAMO"
+
+# --- Evaluation Configuration ---
+evaluation:
+  batch_size: 2
+  num_workers: 8
+  datasets: # Standard evaluation datasets
+    - "datasets/COD10K"
+    - "datasets/CAMO"
+    - "datasets/NC4K"
+
+# --- Prediction Configuration ---
+prediction:
+  batch_size: 1 # 1 for saving individual masks.
+  output_size: null # null = predict at original image size. Set [H, W] for fixed size.
