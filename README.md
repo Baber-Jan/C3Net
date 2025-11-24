@@ -312,9 +312,10 @@ If you find C3Net useful in your research, please cite:
 @article{jan2025c3net,
   title={C3Net: Context-Contrast Network for Camouflaged Object Detection},
   author={Jan, Baber and El-Maleh, Aiman H. and Siddiqui, Abdul Jabbar and Bais, Abdul and Anwar, Saeed},
-  journal={IEEE Transactions on Artificial Intelligence},
-  year={2025},
-  note={Submitted to IEEE Transactions on Artificial Intelligence}
+  eprint={2511.12627},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2511.12627},
 }
 ```
 
